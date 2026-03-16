@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+A.Team → Zoho Books Invoice Pipeline
+
+Usage:
+  zoho-ateam-invoice <timesheet.csv> <invoice.pdf>
+  zoho-ateam-invoice --batch <directory>
+
+Reads A.Team timesheet CSVs and invoice PDFs, creates matching invoices in
+Zoho Books, marks them as sent (no email), records payment to Bluevine.
+
+Credentials: sourced from ~/.openclaw/.env (injected by agenix)
+  ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN, ZOHO_ORG_ID
+
+Zoho IDs:
+  A.Team customer: 2647379000002736001
+  Bluevine account: 2647379000000074181
+  Org: 748222255
+
+API scopes required:
+  ZohoBooks.invoices.CREATE,READ,UPDATE
+  ZohoBooks.contacts.CREATE,READ
+  ZohoBooks.settings.READ
+  ZohoBooks.customerpayments.CREATE,READ,UPDATE
+  ZohoBooks.banking.READ
+
+Invoice number format: ATEAM-{earnings_statement_number}
+Rate: $90/hr (A.Team/BespokeLabs standard)
+
+Flow:
+  1. Parse timesheet CSV (columns: Date, Type, Task, Initiative, Hours)
+     - Hours format: H:MM
+     - Use invoice PDF total if CSV disagrees (invoice = what was paid)
+  2. Extract from invoice PDF (pdftotext -layout):
+     - Earnings Statement # → invoice_number
+     - Date of issue → invoice date
+     - TOTAL HOURS, HOURLY RATE, TOTAL PAYMENT
+     - SUMMARY FOR PERIOD → reference
+  3. POST /invoices?ignore_auto_number_generation=true
+  4. POST /invoices/{id}/status/sent (NOT email endpoint)
+  5. POST /customerpayments with account_id=Bluevine
+
+Token refresh: POST https://accounts.zoho.com/oauth/v2/token
+  grant_type=refresh_token
+Auth header: "Authorization: Zoho-oauthtoken {access_token}" (NOT Bearer)
+"""
+
+import csv, subprocess, re, os, sys, json, time, glob
+
+# --- Config ---
+ZOHO_ORG_ID = "748222255"
+ATEAM_CUSTOMER_ID = "2647379000002736001"
+BLUEVINE_ACCOUNT_ID = "2647379000000074181"
+TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
+API_BASE = "https://www.zohoapis.com/books/v3"
+RATE = 90  # $/hr
+
+def load_env():
+    env = {}
+    envfile = os.path.expanduser("~/.openclaw/.env")
+    with open(envfile) as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                env[k] = v
+    return env
+
+def get_access_token(env):
+    r = subprocess.run([
+        "curl", "-s", "-X", "POST", TOKEN_URL,
+        "-d", f"refresh_token={env['ZOHO_REFRESH_TOKEN']}",
+        "-d", f"client_id={env['ZOHO_CLIENT_ID']}",
+        "-d", f"client_secret={env['ZOHO_CLIENT_SECRET']}",
+        "-d", "grant_type=refresh_token"
+    ], capture_output=True, text=True)
+    return json.loads(r.stdout)["access_token"]
+
+def api(method, path, token, data=None, params=""):
+    url = f"{API_BASE}{path}?organization_id={ZOHO_ORG_ID}{params}"
+    cmd = ["curl", "-s", "-X", method, url,
+           "-H", f"Authorization: Zoho-oauthtoken {token}",
+           "-H", "Content-Type: application/json"]
+    if data:
+        cmd += ["-d", json.dumps(data)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return json.loads(r.stdout)
+
+def parse_invoice_pdf(path):
+    r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, text=True)
+    text = r.stdout
+    return {
+        "stmt_number": (re.search(r"Earnings Statement #(\d+)", text) or [None, None])[1],
+        "date": (re.search(r"Date of issue:\s+([\d/]+)", text) or [None, None])[1],
+        "hours": int((re.search(r"TOTAL HOURS\s+(\d+)h", text) or [None, "0"])[1]),
+        "rate": int((re.search(r"HOURLY RATE\s+\$(\d+)", text) or [None, "0"])[1]),
+        "total": float((re.search(r"TOTAL PAYMENT\s+\$([\d,]+)", text) or [None, "0"])[1].replace(",", "")),
+    }
+
+def parse_date(us_date):
+    """Convert MM/DD/YYYY to YYYY-MM-DD"""
+    m, d, y = us_date.split("/")
+    return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+
+def create_invoice(token, inv):
+    data = {
+        "customer_id": ATEAM_CUSTOMER_ID,
+        "date": inv["date_iso"],
+        "due_date": inv["date_iso"],
+        "invoice_number": f"ATEAM-{inv['stmt_number']}",
+        "reference_number": f"A.Team Earnings Statement #{inv['stmt_number']}",
+        "line_items": [{
+            "name": "Engineering Services - BespokeLabs",
+            "description": f"{inv['hours']}h x ${inv['rate']}/hr",
+            "rate": inv["rate"],
+            "quantity": inv["hours"]
+        }]
+    }
+    return api("POST", "/invoices", token, data, "&ignore_auto_number_generation=true")
+
+def mark_sent(token, invoice_id):
+    return api("POST", f"/invoices/{invoice_id}/status/sent", token)
+
+def record_payment(token, invoice_id, amount, date_iso):
+    data = {
+        "customer_id": ATEAM_CUSTOMER_ID,
+        "payment_mode": "Bank Transfer",
+        "amount": amount,
+        "date": date_iso,
+        "account_id": BLUEVINE_ACCOUNT_ID,
+        "invoices": [{"invoice_id": invoice_id, "amount_applied": amount}],
+    }
+    return api("POST", "/customerpayments", token, data)
+
+if __name__ == "__main__":
+    print("A.Team → Zoho Books Invoice Pipeline")
+    print("See script header for usage and documentation.")
+    print("This script is also documentation for Nicole's future sessions.")
