@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+Zoho Books Invoice Pipeline
+
+Usage:
+  zoho-ateam-invoice <invoice.pdf>
+  zoho-ateam-invoice --csv <timesheet.csv> <invoice.pdf>
+  zoho-ateam-invoice --list
+
+Reads invoice PDFs (and optionally timesheet CSVs), creates matching invoices
+in Zoho Books, marks them as sent (no email), records payment.
+
+Idempotent: checks for existing invoice by number before creating.
+
+Required environment variables (or .env file — see load_env()):
+  ZOHO_CLIENT_ID
+  ZOHO_CLIENT_SECRET
+  ZOHO_REFRESH_TOKEN
+  ZOHO_ORG_ID
+  ZOHO_CUSTOMER_ID
+  ZOHO_BANK_ACCOUNT_ID
+  ZOHO_INVOICE_PREFIX     (e.g. "INV", default: "INV")
+  ZOHO_RATE               (hourly rate, default: 90)
+
+Credential lookup order:
+  1. Environment variables
+  2. ZOHO_ENV_FILE path
+  3. ~/.env
+  4. ~/.openclaw/.env
+
+Data discrepancy rule: if CSV hours × rate ≠ PDF total, use PDF total (= what was paid).
+"""
+
+import csv, subprocess, re, os, sys, json, argparse
+
+TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
+API_BASE = "https://www.zohoapis.com/books/v3"
+
+ZOHO_KEYS = (
+    "ZOHO_CLIENT_ID",
+    "ZOHO_CLIENT_SECRET",
+    "ZOHO_REFRESH_TOKEN",
+    "ZOHO_ORG_ID",
+    "ZOHO_CUSTOMER_ID",
+    "ZOHO_BANK_ACCOUNT_ID",
+)
+
+_DEFAULT_ENV_PATHS = [
+    "~/.env",
+    "~/.openclaw/.env",
+]
+
+
+def load_env(env_file=None):
+    """
+    Load credentials using standard precedence:
+      1. Environment variables
+      2. .env file — checked in order:
+           a. env_file argument
+           b. ZOHO_ENV_FILE environment variable
+           c. ~/.env
+           d. ~/.openclaw/.env  (OpenClaw default)
+    Returns a merged dict; env vars take precedence over file values.
+    """
+    result = {k: os.environ[k] for k in ZOHO_KEYS if k in os.environ}
+
+    if all(k in result for k in ZOHO_KEYS):
+        return result
+
+    candidates = []
+    if env_file:
+        candidates.append(env_file)
+    if os.environ.get("ZOHO_ENV_FILE"):
+        candidates.append(os.environ["ZOHO_ENV_FILE"])
+    candidates += [os.path.expanduser(p) for p in _DEFAULT_ENV_PATHS]
+
+    file_env = {}
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        file_env[k] = v
+            break
+
+    return {**file_env, **result}
+
+
+def require_env(env, *keys):
+    missing = [k for k in keys if not env.get(k)]
+    if missing:
+        print(f"Missing required config: {', '.join(missing)}", file=sys.stderr)
+        print("Set as environment variables or in a .env file. See .env.example.", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_access_token(env):
+    r = subprocess.run([
+        "curl", "-s", "-X", "POST", TOKEN_URL,
+        "-d", f"refresh_token={env['ZOHO_REFRESH_TOKEN']}",
+        "-d", f"client_id={env['ZOHO_CLIENT_ID']}",
+        "-d", f"client_secret={env['ZOHO_CLIENT_SECRET']}",
+        "-d", "grant_type=refresh_token"
+    ], capture_output=True, text=True)
+    resp = json.loads(r.stdout)
+    if "access_token" not in resp:
+        print(f"Token refresh failed: {resp}", file=sys.stderr)
+        sys.exit(1)
+    return resp["access_token"]
+
+
+def api(method, path, token, org_id, data=None, extra_params=""):
+    url = f"{API_BASE}{path}?organization_id={org_id}{extra_params}"
+    cmd = ["curl", "-s", "-X", method, url,
+           "-H", f"Authorization: Zoho-oauthtoken {token}",
+           "-H", "Content-Type: application/json"]
+    if data:
+        cmd += ["-d", json.dumps(data)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return json.loads(r.stdout)
+
+
+def find_invoice_by_number(token, org_id, invoice_number):
+    resp = api("GET", "/invoices", token, org_id, extra_params=f"&invoice_number={invoice_number}")
+    invoices = resp.get("invoices", [])
+    return invoices[0] if invoices else None
+
+
+def list_invoices(token, org_id, customer_id):
+    resp = api("GET", "/invoices", token, org_id,
+               extra_params=f"&customer_id={customer_id}&per_page=200")
+    invoices = resp.get("invoices", [])
+    invoices.sort(key=lambda i: i.get("invoice_number", ""))
+
+    status_icon = {"paid": "✓", "sent": "→", "draft": "·", "overdue": "!"}
+    print(f"{'Invoice #':<20} {'Date':<12} {'Total':>10}  {'Status'}")
+    print("─" * 55)
+    for inv in invoices:
+        status = inv.get("status", "")
+        icon = status_icon.get(status, " ")
+        print(f"{inv['invoice_number']:<20} {inv['date']:<12} ${float(inv['total']):>9,.2f}  {icon} {status}")
+
+
+def parse_invoice_pdf(path):
+    r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"pdftotext failed on {path}: {r.stderr}", file=sys.stderr)
+        sys.exit(1)
+    text = r.stdout
+
+    stmt = re.search(r"Earnings Statement #(\d+)", text)
+    date = re.search(r"Date of issue:\s+([\d/]+)", text)
+    hours = re.search(r"TOTAL HOURS\s+(\d+)h", text)
+    rate = re.search(r"HOURLY RATE\s+\$(\d+)", text)
+    total = re.search(r"TOTAL PAYMENT\s+\$([\d,]+(?:\.\d+)?)", text)
+    period = re.search(r"SUMMARY FOR PERIOD\s+(.+)", text)
+
+    if not all([stmt, date, total]):
+        print("Could not parse required fields from PDF.", file=sys.stderr)
+        print(f"Found: stmt={stmt}, date={date}, total={total}", file=sys.stderr)
+        sys.exit(1)
+
+    return {
+        "stmt_number": stmt.group(1),
+        "date_us": date.group(1),
+        "hours": int(hours.group(1)) if hours else None,
+        "rate": int(rate.group(1)) if rate else None,
+        "total": float(total.group(1).replace(",", "")),
+        "period": period.group(1).strip() if period else "",
+    }
+
+
+def parse_csv_hours(path):
+    total = 0.0
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            h = row.get("Hours", "0").strip()
+            if ":" in h:
+                parts = h.split(":")
+                total += int(parts[0]) + int(parts[1]) / 60
+            else:
+                try:
+                    total += float(h)
+                except ValueError:
+                    pass
+    return total
+
+
+def parse_date(us_date):
+    m, d, y = us_date.split("/")
+    return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+
+
+def create_invoice(token, org_id, customer_id, inv_number, date_iso, hours, rate, total, period):
+    data = {
+        "customer_id": customer_id,
+        "date": date_iso,
+        "due_date": date_iso,
+        "invoice_number": inv_number,
+        "reference_number": f"Statement #{inv_number.split('-')[-1]}",
+        "line_items": [{
+            "name": "Engineering Services",
+            "description": f"{hours}h × ${rate}/hr — {period}",
+            "rate": rate,
+            "quantity": hours,
+        }]
+    }
+    resp = api("POST", "/invoices", token, org_id, data, "&ignore_auto_number_generation=true")
+    if resp.get("code", 0) != 0:
+        print(f"Invoice creation failed: {resp}", file=sys.stderr)
+        sys.exit(1)
+    return resp["invoice"]["invoice_id"]
+
+
+def mark_sent(token, org_id, invoice_id):
+    resp = api("POST", f"/invoices/{invoice_id}/status/sent", token, org_id)
+    if resp.get("code", 0) != 0:
+        print(f"Mark-sent failed: {resp}", file=sys.stderr)
+        sys.exit(1)
+
+
+def record_payment(token, org_id, customer_id, bank_account_id, invoice_id, amount, date_iso):
+    data = {
+        "customer_id": customer_id,
+        "payment_mode": "Bank Transfer",
+        "amount": amount,
+        "date": date_iso,
+        "account_id": bank_account_id,
+        "invoices": [{"invoice_id": invoice_id, "amount_applied": amount}],
+    }
+    resp = api("POST", "/customerpayments", token, org_id, data)
+    if resp.get("code", 0) != 0:
+        print(f"Payment recording failed: {resp}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Zoho Books invoice pipeline",
+        epilog="CSV is optional. If omitted, the PDF total is used without a discrepancy check.",
+    )
+    p.add_argument("pdf_file", nargs="?", help="Invoice PDF (required unless --list)")
+    p.add_argument("--csv", dest="csv_file", default=None, metavar="CSV",
+                   help="Timesheet CSV (optional — enables hours/total cross-check)")
+    p.add_argument("--list", action="store_true", help="List existing invoices")
+    p.add_argument("--dry-run", action="store_true", help="Parse only, don't write to Zoho")
+    args = p.parse_args()
+
+    env = load_env()
+
+    if args.list:
+        require_env(env, "ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN",
+                    "ZOHO_ORG_ID", "ZOHO_CUSTOMER_ID")
+        token = get_access_token(env)
+        list_invoices(token, env["ZOHO_ORG_ID"], env["ZOHO_CUSTOMER_ID"])
+        return
+
+    if not args.pdf_file:
+        p.print_help()
+        sys.exit(1)
+
+    require_env(env, *ZOHO_KEYS)
+
+    org_id = env["ZOHO_ORG_ID"]
+    customer_id = env["ZOHO_CUSTOMER_ID"]
+    bank_account_id = env["ZOHO_BANK_ACCOUNT_ID"]
+    invoice_prefix = env.get("ZOHO_INVOICE_PREFIX", "INV")
+    rate = int(env.get("ZOHO_RATE", 90))
+
+    token = get_access_token(env)
+
+    print(f"Parsing PDF: {args.pdf_file}")
+    pdf = parse_invoice_pdf(args.pdf_file)
+
+    csv_hours = None
+    if args.csv_file:
+        print(f"Parsing CSV: {args.csv_file}")
+        csv_hours = parse_csv_hours(args.csv_file)
+
+    inv_number = f"{invoice_prefix}-{pdf['stmt_number']}"
+    date_iso = parse_date(pdf["date_us"])
+    hours = pdf["hours"] if pdf["hours"] is not None else (int(csv_hours) if csv_hours is not None else 0)
+    effective_rate = pdf["rate"] if pdf["rate"] is not None else rate
+    pdf_total = pdf["total"]
+
+    print(f"\n  Invoice:  {inv_number}")
+    print(f"  Date:     {date_iso}")
+    print(f"  Period:   {pdf['period']}")
+    if csv_hours is not None:
+        print(f"  Hours:    {hours}h (PDF) / {csv_hours:.1f}h (CSV)")
+        csv_total = round(csv_hours * effective_rate, 2)
+        if abs(csv_total - pdf_total) > 0.01:
+            print(f"  ⚠ Total mismatch: CSV says ${csv_total:,.2f}, PDF says ${pdf_total:,.2f} — using PDF")
+    else:
+        print(f"  Hours:    {hours}h (PDF, no CSV provided)")
+    print(f"  Total:    ${pdf_total:,.2f}")
+
+    if args.dry_run:
+        print("\n[dry-run] No changes made.")
+        return
+
+    existing = find_invoice_by_number(token, org_id, inv_number)
+    if existing:
+        print(f"\n✓ Invoice {inv_number} already exists (ID: {existing['invoice_id']}, status: {existing['status']}) — skipping.")
+        return
+
+    print(f"\nCreating invoice {inv_number}...")
+    invoice_id = create_invoice(token, org_id, customer_id, inv_number, date_iso,
+                                hours, effective_rate, pdf_total, pdf["period"])
+    print(f"  Created: {invoice_id}")
+
+    print("Marking as sent (no email)...")
+    mark_sent(token, org_id, invoice_id)
+
+    print("Recording payment...")
+    record_payment(token, org_id, customer_id, bank_account_id, invoice_id, pdf_total, date_iso)
+
+    print(f"\n✓ Done — {inv_number} created, sent, paid (${pdf_total:,.2f})")
+
+
+if __name__ == "__main__":
+    main()

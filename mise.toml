@@ -1,0 +1,5 @@
+[tools]
+python = "3.11"
+
+[env]
+UV_PROJECT_ENVIRONMENT = "{{config_root}}/.venv"
