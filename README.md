@@ -10,15 +10,16 @@ Built for a contractor billing pipeline at Arboreal Studios — but the approach
 
 1. Parses an invoice PDF (statement number, date, hours, total)
 2. Optionally cross-checks against a timesheet CSV — warns if totals disagree, uses PDF amount
-3. Creates a backdated invoice in Zoho Books with a custom invoice number
-4. Marks it as sent (without emailing the customer)
-5. Records payment against a bank account (Bluevine in this case)
+3. Refuses outright if the PDF disagrees with *itself* (hours × rate ≠ stated total), rather than raising an invoice for one amount and recording payment for another
+4. Creates a backdated invoice in Zoho Books with a custom invoice number
+5. Marks it as sent (without emailing the customer)
+6. Records payment against a bank account
 
 **Idempotent** — checks for an existing invoice by number before creating. Safe to re-run.
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+ (standard library only — no runtime dependencies)
 - `pdftotext` (from `poppler-utils`)
 - Zoho Books OAuth credentials (client ID, client secret, refresh token)
 
@@ -67,6 +68,22 @@ ZOHO_REFRESH_TOKEN=...
 ZOHO_ORG_ID=...
 ```
 
+Using mise? Put the non-secret account values in a gitignored `.mise.local.toml`
+and they're exported automatically inside the project directory:
+
+```toml
+[env]
+ZOHO_ORG_ID = "..."
+ZOHO_CUSTOMER_ID = "..."
+ZOHO_BANK_ACCOUNT_ID = "..."
+ZOHO_INVOICE_PREFIX = "ACME"
+ZOHO_RATE = "90"
+```
+
+Keep the OAuth secrets out of that file — leave them in your secret store or
+`~/.env`. Env files are merged in the order above, earliest wins, and real
+environment variables beat all of them.
+
 Get OAuth credentials via the [Zoho API Console](https://api-console.zoho.com/) (Self Client app). Required scopes:
 
 ```
@@ -77,7 +94,7 @@ ZohoBooks.customerpayments.CREATE,READ,UPDATE
 ZohoBooks.banking.READ
 ```
 
-Update the customer ID, bank account ID, and rate constants at the top of the script to match your setup.
+Nothing is hardcoded — the customer ID, bank account ID, invoice prefix, and rate all come from the environment.
 
 ## Usage
 
@@ -88,13 +105,22 @@ scripts/zoho-ateam-invoice invoice.pdf --dry-run
 # With CSV cross-check (warns if CSV hours × rate ≠ PDF total)
 scripts/zoho-ateam-invoice --csv timesheet.csv invoice.pdf --dry-run
 
+# A whole folder — every PDF in it, CSVs paired by billing period
+scripts/zoho-ateam-invoice ~/Downloads --dry-run
+
 # Run for real
 scripts/zoho-ateam-invoice invoice.pdf
-scripts/zoho-ateam-invoice --csv timesheet.csv invoice.pdf
+scripts/zoho-ateam-invoice ~/Downloads
 
 # List existing invoices
 scripts/zoho-ateam-invoice --list
 ```
+
+Point it at a directory and it walks every PDF inside. Unrelated PDFs (bank
+statements, tax forms) are ignored and counted rather than failing the run, and
+timesheet CSVs sitting alongside are matched to invoices by billing period —
+ambiguous matches are skipped with a warning rather than guessed at. A single
+bad export is reported and the rest of the batch continues.
 
 ## Inputs
 
@@ -109,7 +135,7 @@ If both are provided and the totals disagree, the script warns and uses the PDF 
 uv run pytest tests/ -v
 ```
 
-21 tests covering date parsing, CSV hour formats, PDF regex parsing, idempotency, discrepancy detection, env credential loading (precedence), API payload shape, org ID propagation, and payment routing.
+52 tests covering date parsing, CSV hour formats, PDF regex parsing, exact-match idempotency, discrepancy detection, the invoice-total guard, env credential loading (precedence and merging), API payload shape, org ID propagation, payment routing, filename period-pairing, and batch behavior.
 
 ## Notes on the Zoho API
 

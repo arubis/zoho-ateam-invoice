@@ -28,10 +28,16 @@ Credential lookup order:
   3. ~/.env
   4. ~/.openclaw/.env
 
-Data discrepancy rule: if CSV hours × rate ≠ PDF total, use PDF total (= what was paid).
+Data discrepancy rules:
+  CSV vs PDF   — if CSV hours × rate ≠ PDF total, warn and use the PDF (= what was paid).
+  PDF internal — if hours × rate ≠ PDF total, refuse. Booking a total that disagrees
+                 with its own line item is a bookkeeping error, not something to guess at.
 """
 
 import csv, subprocess, re, os, sys, json, argparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
 API_BASE = "https://www.zohoapis.com/books/v3"
@@ -45,10 +51,25 @@ ZOHO_KEYS = (
     "ZOHO_BANK_ACCOUNT_ID",
 )
 
+# Optional, with defaults applied at the call site.
+ZOHO_OPTIONAL_KEYS = ("ZOHO_INVOICE_PREFIX", "ZOHO_RATE")
+
 _DEFAULT_ENV_PATHS = [
     "~/.env",
     "~/.openclaw/.env",
 ]
+
+
+class InvoiceError(Exception):
+    """A failure affecting one invoice. In batch mode the run continues."""
+
+
+class NotAnInvoice(InvoiceError):
+    """
+    A PDF with none of the expected markers — a bank statement that happens to
+    share a download folder, not a broken export. Walking a directory ignores
+    these; naming one explicitly is still an error.
+    """
 
 
 def load_env(env_file=None):
@@ -62,7 +83,7 @@ def load_env(env_file=None):
            d. ~/.openclaw/.env  (OpenClaw default)
     Returns a merged dict; env vars take precedence over file values.
     """
-    result = {k: os.environ[k] for k in ZOHO_KEYS if k in os.environ}
+    result = {k: os.environ[k] for k in ZOHO_KEYS + ZOHO_OPTIONAL_KEYS if k in os.environ}
 
     if all(k in result for k in ZOHO_KEYS):
         return result
@@ -74,16 +95,18 @@ def load_env(env_file=None):
         candidates.append(os.environ["ZOHO_ENV_FILE"])
     candidates += [os.path.expanduser(p) for p in _DEFAULT_ENV_PATHS]
 
+    # Merge every candidate file, earliest wins. Stopping at the first file that
+    # merely *exists* means an unrelated ~/.env shadows ~/.openclaw/.env entirely.
     file_env = {}
     for path in candidates:
-        if os.path.exists(path):
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if "=" in line and not line.startswith("#"):
-                        k, v = line.split("=", 1)
-                        file_env[k] = v
-            break
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    file_env.setdefault(k.strip(), v.strip().strip("\"'"))
 
     return {**file_env, **result}
 
@@ -96,15 +119,39 @@ def require_env(env, *keys):
         sys.exit(1)
 
 
+def request_json(url, method="GET", data=None, headers=None):
+    """
+    Return the decoded JSON body. Zoho signals failure in the body with a non-zero
+    `code`, often alongside a 4xx status, so error responses are parsed rather than
+    raised — callers inspect `code` themselves.
+    """
+    req = Request(url, data=data, headers=headers or {}, method=method)
+    try:
+        with urlopen(req) as resp:
+            body = resp.read()
+    except HTTPError as e:
+        body = e.read()
+    except URLError as e:
+        print(f"Network error calling {url}: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        print(f"Non-JSON response from {url}: {body[:200]!r}", file=sys.stderr)
+        sys.exit(1)
+
+
 def get_access_token(env):
-    r = subprocess.run([
-        "curl", "-s", "-X", "POST", TOKEN_URL,
-        "-d", f"refresh_token={env['ZOHO_REFRESH_TOKEN']}",
-        "-d", f"client_id={env['ZOHO_CLIENT_ID']}",
-        "-d", f"client_secret={env['ZOHO_CLIENT_SECRET']}",
-        "-d", "grant_type=refresh_token"
-    ], capture_output=True, text=True)
-    resp = json.loads(r.stdout)
+    # Credentials go in the request body, never in argv — process arguments are
+    # world-readable via `ps` for the life of the call.
+    body = urlencode({
+        "refresh_token": env["ZOHO_REFRESH_TOKEN"],
+        "client_id": env["ZOHO_CLIENT_ID"],
+        "client_secret": env["ZOHO_CLIENT_SECRET"],
+        "grant_type": "refresh_token",
+    }).encode()
+    resp = request_json(TOKEN_URL, "POST", body,
+                        {"Content-Type": "application/x-www-form-urlencoded"})
     if "access_token" not in resp:
         print(f"Token refresh failed: {resp}", file=sys.stderr)
         sys.exit(1)
@@ -113,19 +160,23 @@ def get_access_token(env):
 
 def api(method, path, token, org_id, data=None, extra_params=""):
     url = f"{API_BASE}{path}?organization_id={org_id}{extra_params}"
-    cmd = ["curl", "-s", "-X", method, url,
-           "-H", f"Authorization: Zoho-oauthtoken {token}",
-           "-H", "Content-Type: application/json"]
-    if data:
-        cmd += ["-d", json.dumps(data)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return json.loads(r.stdout)
+    return request_json(
+        url, method,
+        json.dumps(data).encode() if data else None,
+        {"Authorization": f"Zoho-oauthtoken {token}",
+         "Content-Type": "application/json"},
+    )
 
 
 def find_invoice_by_number(token, org_id, invoice_number):
     resp = api("GET", "/invoices", token, org_id, extra_params=f"&invoice_number={invoice_number}")
-    invoices = resp.get("invoices", [])
-    return invoices[0] if invoices else None
+    # Zoho's invoice_number filter matches substrings — INV-812 also returns
+    # INV-81212. On an idempotency guard a false positive silently skips a real
+    # invoice, so match exactly.
+    for inv in resp.get("invoices", []):
+        if inv.get("invoice_number") == invoice_number:
+            return inv
+    return None
 
 
 def list_invoices(token, org_id, customer_id):
@@ -143,32 +194,56 @@ def list_invoices(token, org_id, customer_id):
         print(f"{inv['invoice_number']:<20} {inv['date']:<12} ${float(inv['total']):>9,.2f}  {icon} {status}")
 
 
+def extract_period(text):
+    """
+    The billing period, which ends up in the invoice line description.
+
+    In the real exports "SUMMARY FOR PERIOD" is a *column header* and the value
+    sits on the next line ("01/01-01/15/2026"), with "FROM ... TO" heading the
+    address columns to its right. Taking the rest of the header line puts the
+    literal text "FROM  TO" on the invoice, so fall through to the next line
+    whenever the same-line remainder is empty or is itself a header.
+    """
+    m = re.search(r"SUMMARY FOR PERIOD[ \t]*(.*)\n\s*(\S+)", text)
+    if not m:
+        return ""
+    same_line = m.group(1).strip()
+    if same_line and not re.match(r"FROM\b", same_line):
+        return same_line
+    return m.group(2).strip()
+
+
 def parse_invoice_pdf(path):
     r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"pdftotext failed on {path}: {r.stderr}", file=sys.stderr)
-        sys.exit(1)
+        raise InvoiceError(f"pdftotext failed: {r.stderr.strip()}")
     text = r.stdout
 
     stmt = re.search(r"Earnings Statement #(\d+)", text)
     date = re.search(r"Date of issue:\s+([\d/]+)", text)
-    hours = re.search(r"TOTAL HOURS\s+(\d+)h", text)
+    # Half hours are real (95.5h → $8,595 at $90). An integer-only pattern finds
+    # nothing on those, which used to fall back to 0 hours.
+    hours = re.search(r"TOTAL HOURS\s+(\d+(?:\.\d+)?)h", text)
     rate = re.search(r"HOURLY RATE\s+\$(\d+)", text)
     total = re.search(r"TOTAL PAYMENT\s+\$([\d,]+(?:\.\d+)?)", text)
-    period = re.search(r"SUMMARY FOR PERIOD\s+(.+)", text)
+    period = extract_period(text)
 
+    if not any([stmt, date, total]):
+        # Not one marker matched — this isn't an earnings statement at all.
+        raise NotAnInvoice("not an invoice PDF")
     if not all([stmt, date, total]):
-        print("Could not parse required fields from PDF.", file=sys.stderr)
-        print(f"Found: stmt={stmt}, date={date}, total={total}", file=sys.stderr)
-        sys.exit(1)
+        # Some markers matched, so it looks like an export we failed to read.
+        found = ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in
+                          (("statement#", stmt), ("date", date), ("total", total)))
+        raise InvoiceError(f"could not parse required fields from PDF ({found})")
 
     return {
         "stmt_number": stmt.group(1),
         "date_us": date.group(1),
-        "hours": int(hours.group(1)) if hours else None,
+        "hours": float(hours.group(1)) if hours else None,
         "rate": int(rate.group(1)) if rate else None,
         "total": float(total.group(1).replace(",", "")),
-        "period": period.group(1).strip() if period else "",
+        "period": period,
     }
 
 
@@ -177,10 +252,15 @@ def parse_csv_hours(path):
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            h = row.get("Hours", "0").strip()
+            # DictReader fills short rows with None rather than omitting the key,
+            # so the default on .get() never fires — real exports have such rows.
+            h = (row.get("Hours") or "0").strip()
             if ":" in h:
                 parts = h.split(":")
-                total += int(parts[0]) + int(parts[1]) / 60
+                try:
+                    total += int(parts[0]) + int(parts[1]) / 60
+                except ValueError:
+                    pass
             else:
                 try:
                     total += float(h)
@@ -189,12 +269,81 @@ def parse_csv_hours(path):
     return total
 
 
+# Billing period as it appears in export filenames. Both formats in the wild:
+#   "A.Team Invoice - 2026 Jan. 01-15 (82231).pdf"   → Jan. 01-15
+#   "Dylan Fitzgerald's Timesheet - Jan 1 - Jan 15.csv" → Jan 1 - Jan 15
+_PERIOD_RE = re.compile(
+    r"([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})\s*[-–—]\s*(?:[A-Za-z]{3}[a-z]*\.?\s+)?(\d{1,2})"
+)
+
+
+def period_key(filename):
+    """
+    (month, start_day, end_day) for a filename, or None if no period is found.
+    The year is deliberately ignored — timesheet exports don't carry one, which
+    is why pair_csvs() has to treat repeated month ranges as ambiguous.
+    """
+    m = _PERIOD_RE.search(os.path.basename(filename))
+    if not m:
+        return None
+    return (m.group(1).lower(), int(m.group(2)), int(m.group(3)))
+
+
+def pair_csvs(pdf_paths, csv_paths):
+    """
+    Map each PDF to a timesheet CSV covering the same billing period.
+
+    Returns (pairs, ambiguous). A period claimed by more than one PDF or more
+    than one CSV is left unpaired and reported: without a year in the CSV name,
+    "Dec 16 - Dec 31" cannot be attributed to 2025 over 2026, and quietly
+    cross-checking against the wrong timesheet is worse than not checking.
+    """
+    pdfs_by_period, csvs_by_period = {}, {}
+    for path in pdf_paths:
+        pdfs_by_period.setdefault(period_key(path), []).append(path)
+    for path in csv_paths:
+        csvs_by_period.setdefault(period_key(path), []).append(path)
+
+    pairs, ambiguous = {}, []
+    for period, pdfs in pdfs_by_period.items():
+        csvs = csvs_by_period.get(period, [])
+        if period is None or not csvs:
+            continue
+        if len(pdfs) > 1 or len(csvs) > 1:
+            ambiguous += pdfs
+            continue
+        pairs[pdfs[0]] = csvs[0]
+    return pairs, ambiguous
+
+
+def collect_pdfs(paths):
+    """Expand any directory argument into the PDFs directly inside it."""
+    out = []
+    for path in paths:
+        if os.path.isdir(path):
+            out += sorted(os.path.join(path, n) for n in os.listdir(path)
+                          if n.lower().endswith(".pdf"))
+        else:
+            out.append(path)
+    return out
+
+
 def parse_date(us_date):
     m, d, y = us_date.split("/")
     return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
 
 
 def create_invoice(token, org_id, customer_id, inv_number, date_iso, hours, rate, total, period):
+    # The invoice total is whatever Zoho computes from rate × quantity. If that
+    # disagrees with the PDF, the payment recorded below would not match the
+    # invoice raised — refuse rather than book two different numbers.
+    computed = round(hours * rate, 2)
+    if abs(computed - total) > 0.01:
+        raise InvoiceError(
+            f"{hours:g}h × ${rate}/hr = ${computed:,.2f}, but the PDF total is ${total:,.2f}. "
+            "Fix the hours or rate in the source PDF, or create this invoice by hand."
+        )
+
     data = {
         "customer_id": customer_id,
         "date": date_iso,
@@ -203,23 +352,21 @@ def create_invoice(token, org_id, customer_id, inv_number, date_iso, hours, rate
         "reference_number": f"Statement #{inv_number.split('-')[-1]}",
         "line_items": [{
             "name": "Engineering Services",
-            "description": f"{hours}h × ${rate}/hr — {period}",
+            "description": f"{hours:g}h × ${rate}/hr — {period}",
             "rate": rate,
             "quantity": hours,
         }]
     }
     resp = api("POST", "/invoices", token, org_id, data, "&ignore_auto_number_generation=true")
     if resp.get("code", 0) != 0:
-        print(f"Invoice creation failed: {resp}", file=sys.stderr)
-        sys.exit(1)
+        raise InvoiceError(f"invoice creation failed: {resp.get('message', resp)}")
     return resp["invoice"]["invoice_id"]
 
 
 def mark_sent(token, org_id, invoice_id):
     resp = api("POST", f"/invoices/{invoice_id}/status/sent", token, org_id)
     if resp.get("code", 0) != 0:
-        print(f"Mark-sent failed: {resp}", file=sys.stderr)
-        sys.exit(1)
+        raise InvoiceError(f"mark-sent failed: {resp.get('message', resp)}")
 
 
 def record_payment(token, org_id, customer_id, bank_account_id, invoice_id, amount, date_iso):
@@ -233,18 +380,82 @@ def record_payment(token, org_id, customer_id, bank_account_id, invoice_id, amou
     }
     resp = api("POST", "/customerpayments", token, org_id, data)
     if resp.get("code", 0) != 0:
-        print(f"Payment recording failed: {resp}", file=sys.stderr)
-        sys.exit(1)
+        raise InvoiceError(f"payment recording failed: {resp.get('message', resp)}")
+
+
+def process_pdf(pdf_path, csv_path, cfg, token, dry_run):
+    """
+    Run one PDF through the pipeline. Returns a status for the batch summary:
+    "created", "skipped" (already in Zoho), or "blocked" (dry run found a
+    mismatch). Raises InvoiceError for anything that failed.
+    """
+    # Parse before announcing, so PDFs that turn out not to be invoices don't
+    # each print a header into a directory walk.
+    pdf = parse_invoice_pdf(pdf_path)
+    print(f"\n{'─' * 60}\n{os.path.basename(pdf_path)}")
+
+    csv_hours = None
+    if csv_path:
+        csv_hours = parse_csv_hours(csv_path)
+
+    inv_number = f"{cfg['prefix']}-{pdf['stmt_number']}"
+    date_iso = parse_date(pdf["date_us"])
+    hours = pdf["hours"] if pdf["hours"] is not None else (csv_hours if csv_hours is not None else 0)
+    effective_rate = pdf["rate"] if pdf["rate"] is not None else cfg["rate"]
+    pdf_total = pdf["total"]
+
+    print(f"  Invoice:  {inv_number}")
+    print(f"  Date:     {date_iso}")
+    print(f"  Period:   {pdf['period']}")
+    if csv_hours is not None:
+        print(f"  Hours:    {hours:g}h (PDF) / {csv_hours:.1f}h (CSV — {os.path.basename(csv_path)})")
+        csv_total = round(csv_hours * effective_rate, 2)
+        if abs(csv_total - pdf_total) > 0.01:
+            print(f"  ⚠ Total mismatch: CSV says ${csv_total:,.2f}, PDF says ${pdf_total:,.2f} — using PDF")
+    else:
+        print(f"  Hours:    {hours:g}h (PDF, no CSV)")
+    print(f"  Total:    ${pdf_total:,.2f}")
+
+    # Surface here what create_invoice() would refuse on, so a dry run never
+    # reports clean on an invoice the real run will reject.
+    computed = round(hours * effective_rate, 2)
+    mismatched = abs(computed - pdf_total) > 0.01
+    if mismatched:
+        print(f"  ✗ {hours:g}h × ${effective_rate}/hr = ${computed:,.2f}, but the PDF total is "
+              f"${pdf_total:,.2f} — will refuse to create this invoice.")
+
+    if dry_run:
+        print("  [dry-run] no changes made")
+        return "blocked" if mismatched else "created"
+
+    existing = find_invoice_by_number(token, cfg["org_id"], inv_number)
+    if existing:
+        print(f"  ✓ Already exists (ID: {existing['invoice_id']}, status: {existing['status']}) — skipping")
+        return "skipped"
+
+    print(f"  Creating {inv_number}...")
+    invoice_id = create_invoice(token, cfg["org_id"], cfg["customer_id"], inv_number,
+                                date_iso, hours, effective_rate, pdf_total, pdf["period"])
+    print("  Marking as sent (no email)...")
+    mark_sent(token, cfg["org_id"], invoice_id)
+    print("  Recording payment...")
+    record_payment(token, cfg["org_id"], cfg["customer_id"], cfg["bank_account_id"],
+                   invoice_id, pdf_total, date_iso)
+    print(f"  ✓ {inv_number} created, sent, paid (${pdf_total:,.2f})")
+    return "created"
 
 
 def main():
     p = argparse.ArgumentParser(
         description="Zoho Books invoice pipeline",
-        epilog="CSV is optional. If omitted, the PDF total is used without a discrepancy check.",
+        epilog="Pass one or more PDFs, or a directory to process every PDF inside it. "
+               "In directory mode, timesheet CSVs found alongside the PDFs are paired "
+               "by billing period automatically.",
     )
-    p.add_argument("pdf_file", nargs="?", help="Invoice PDF (required unless --list)")
+    p.add_argument("paths", nargs="*", metavar="PDF|DIR",
+                   help="Invoice PDFs, or a directory to walk (required unless --list)")
     p.add_argument("--csv", dest="csv_file", default=None, metavar="CSV",
-                   help="Timesheet CSV (optional — enables hours/total cross-check)")
+                   help="Timesheet CSV for a single PDF (enables hours/total cross-check)")
     p.add_argument("--list", action="store_true", help="List existing invoices")
     p.add_argument("--dry-run", action="store_true", help="Parse only, don't write to Zoho")
     args = p.parse_args()
@@ -258,67 +469,83 @@ def main():
         list_invoices(token, env["ZOHO_ORG_ID"], env["ZOHO_CUSTOMER_ID"])
         return
 
-    if not args.pdf_file:
+    if not args.paths:
         p.print_help()
         sys.exit(1)
 
     require_env(env, *ZOHO_KEYS)
+    cfg = {
+        "org_id": env["ZOHO_ORG_ID"],
+        "customer_id": env["ZOHO_CUSTOMER_ID"],
+        "bank_account_id": env["ZOHO_BANK_ACCOUNT_ID"],
+        "prefix": env.get("ZOHO_INVOICE_PREFIX", "INV"),
+        "rate": int(env.get("ZOHO_RATE", 90)),
+    }
 
-    org_id = env["ZOHO_ORG_ID"]
-    customer_id = env["ZOHO_CUSTOMER_ID"]
-    bank_account_id = env["ZOHO_BANK_ACCOUNT_ID"]
-    invoice_prefix = env.get("ZOHO_INVOICE_PREFIX", "INV")
-    rate = int(env.get("ZOHO_RATE", 90))
+    # Naming a PDF explicitly means you expect it to be an invoice; walking a
+    # directory does not, so unrelated PDFs are only ignored in directory mode.
+    walked = any(os.path.isdir(path) for path in args.paths)
+    pdfs = collect_pdfs(args.paths)
+    if not pdfs:
+        print(f"No PDFs found in {', '.join(args.paths)}", file=sys.stderr)
+        sys.exit(1)
 
-    token = get_access_token(env)
+    if args.csv_file and len(pdfs) > 1:
+        print("--csv applies to a single PDF; drop it and let directory mode pair by period.",
+              file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Parsing PDF: {args.pdf_file}")
-    pdf = parse_invoice_pdf(args.pdf_file)
-
-    csv_hours = None
+    # Explicit --csv wins; otherwise pair by billing period against CSVs sitting
+    # beside the PDFs.
     if args.csv_file:
-        print(f"Parsing CSV: {args.csv_file}")
-        csv_hours = parse_csv_hours(args.csv_file)
-
-    inv_number = f"{invoice_prefix}-{pdf['stmt_number']}"
-    date_iso = parse_date(pdf["date_us"])
-    hours = pdf["hours"] if pdf["hours"] is not None else (int(csv_hours) if csv_hours is not None else 0)
-    effective_rate = pdf["rate"] if pdf["rate"] is not None else rate
-    pdf_total = pdf["total"]
-
-    print(f"\n  Invoice:  {inv_number}")
-    print(f"  Date:     {date_iso}")
-    print(f"  Period:   {pdf['period']}")
-    if csv_hours is not None:
-        print(f"  Hours:    {hours}h (PDF) / {csv_hours:.1f}h (CSV)")
-        csv_total = round(csv_hours * effective_rate, 2)
-        if abs(csv_total - pdf_total) > 0.01:
-            print(f"  ⚠ Total mismatch: CSV says ${csv_total:,.2f}, PDF says ${pdf_total:,.2f} — using PDF")
+        csv_for = {pdfs[0]: args.csv_file}
     else:
-        print(f"  Hours:    {hours}h (PDF, no CSV provided)")
-    print(f"  Total:    ${pdf_total:,.2f}")
+        siblings = {os.path.dirname(f) or "." for f in pdfs}
+        candidates = sorted(os.path.join(d, n) for d in siblings
+                            for n in os.listdir(d) if n.lower().endswith(".csv"))
+        csv_for, ambiguous = pair_csvs(pdfs, candidates)
+        if ambiguous:
+            print(f"⚠ {len(ambiguous)} PDF(s) share a billing period with another export — "
+                  "skipping the CSV cross-check for them (timesheet names carry no year):")
+            for path in ambiguous:
+                print(f"    {os.path.basename(path)}")
 
-    if args.dry_run:
-        print("\n[dry-run] No changes made.")
-        return
+    print(f"Processing {len(pdfs)} invoice(s)"
+          f"{' [dry run]' if args.dry_run else ''}, {len(csv_for)} with a CSV cross-check")
 
-    existing = find_invoice_by_number(token, org_id, inv_number)
-    if existing:
-        print(f"\n✓ Invoice {inv_number} already exists (ID: {existing['invoice_id']}, status: {existing['status']}) — skipping.")
-        return
+    token = None if args.dry_run else get_access_token(env)
 
-    print(f"\nCreating invoice {inv_number}...")
-    invoice_id = create_invoice(token, org_id, customer_id, inv_number, date_iso,
-                                hours, effective_rate, pdf_total, pdf["period"])
-    print(f"  Created: {invoice_id}")
+    results = {}
+    for pdf_path in pdfs:
+        try:
+            results[pdf_path] = process_pdf(pdf_path, csv_for.get(pdf_path), cfg,
+                                            token, args.dry_run)
+        except NotAnInvoice:
+            if not walked:
+                print(f"  ✗ {os.path.basename(pdf_path)} is not an invoice PDF", file=sys.stderr)
+                results[pdf_path] = "failed"
+            else:
+                results[pdf_path] = "ignored"
+        except InvoiceError as e:
+            # One bad export shouldn't strand the rest of the batch — the run is
+            # idempotent, so re-running after a fix is safe.
+            print(f"  ✗ {e}", file=sys.stderr)
+            results[pdf_path] = "failed"
 
-    print("Marking as sent (no email)...")
-    mark_sent(token, org_id, invoice_id)
+    tally = {k: sum(1 for v in results.values() if v == k)
+             for k in ("created", "skipped", "blocked", "failed", "ignored")}
+    print(f"\n{'─' * 60}")
+    verb = "would create" if args.dry_run else "created"
+    print(f"{verb}: {tally['created']}   already in Zoho: {tally['skipped']}   "
+          f"blocked: {tally['blocked']}   failed: {tally['failed']}")
+    if tally["ignored"]:
+        print(f"ignored {tally['ignored']} PDF(s) in the folder that aren't invoices")
+    for path, status in results.items():
+        if status in ("failed", "blocked"):
+            print(f"  {status}: {os.path.basename(path)}")
 
-    print("Recording payment...")
-    record_payment(token, org_id, customer_id, bank_account_id, invoice_id, pdf_total, date_iso)
-
-    print(f"\n✓ Done — {inv_number} created, sent, paid (${pdf_total:,.2f})")
+    if tally["failed"] or tally["blocked"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

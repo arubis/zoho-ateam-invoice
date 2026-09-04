@@ -1,5 +1,10 @@
 __pycache__/
 **/*.pyc
 .venv/
-uv.lock
+.pytest_cache/
 .python-version
+
+# Local config — real org/customer/bank IDs and credentials
+.mise.local.toml
+mise.local.toml
+.env
