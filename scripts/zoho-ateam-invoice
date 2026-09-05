@@ -221,9 +221,10 @@ def parse_invoice_pdf(path):
 
     stmt = re.search(r"Earnings Statement #(\d+)", text)
     date = re.search(r"Date of issue:\s+([\d/]+)", text)
-    # Half hours are real (95.5h → $8,595 at $90). An integer-only pattern finds
-    # nothing on those, which used to fall back to 0 hours.
-    hours = re.search(r"TOTAL HOURS\s+(\d+(?:\.\d+)?)h", text)
+    # Hours are "79h 30m", not a decimal. Matching only the "79h" silently drops
+    # the minutes: 79 × $90 = $7,110 against a stated total of $7,155, which is
+    # how INV-82924 came to be created wrong and voided.
+    hours = re.search(r"TOTAL HOURS\s+(\d+)h(?:\s*(\d+)m)?", text)
     rate = re.search(r"HOURLY RATE\s+\$(\d+)", text)
     total = re.search(r"TOTAL PAYMENT\s+\$([\d,]+(?:\.\d+)?)", text)
     period = extract_period(text)
@@ -240,7 +241,7 @@ def parse_invoice_pdf(path):
     return {
         "stmt_number": stmt.group(1),
         "date_us": date.group(1),
-        "hours": float(hours.group(1)) if hours else None,
+        "hours": int(hours.group(1)) + int(hours.group(2) or 0) / 60 if hours else None,
         "rate": int(rate.group(1)) if rate else None,
         "total": float(total.group(1).replace(",", "")),
         "period": period,
@@ -269,11 +270,15 @@ def parse_csv_hours(path):
     return total
 
 
-# Billing period as it appears in export filenames. Both formats in the wild:
-#   "A.Team Invoice - 2026 Jan. 01-15 (82231).pdf"   → Jan. 01-15
-#   "Dylan Fitzgerald's Timesheet - Jan 1 - Jan 15.csv" → Jan 1 - Jan 15
+# Billing period as it appears in export filenames. Three formats in the wild:
+#   "A.Team Invoice - 2026 Jan. 01-15 (82231).pdf"        → Jan. 01-15
+#   "Dylan Fitzgerald's Timesheet - Jan 1 - Jan 15.csv"   → Jan 1 - Jan 15
+#   "A.Team_Invoice_-_2026_Mar._01-15_85565---<uuid>.pdf" → Mar._01-15
+# The third is how OpenClaw stores attachments in ~/.openclaw/media/inbound:
+# spaces become underscores, so underscores count as separators too.
 _PERIOD_RE = re.compile(
-    r"([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})\s*[-–—]\s*(?:[A-Za-z]{3}[a-z]*\.?\s+)?(\d{1,2})"
+    r"([A-Za-z]{3})[a-z]*\.?[\s_]+(\d{1,2})[\s_]*[-–—][\s_]*"
+    r"(?:[A-Za-z]{3}[a-z]*\.?[\s_]+)?(\d{1,2})"
 )
 
 

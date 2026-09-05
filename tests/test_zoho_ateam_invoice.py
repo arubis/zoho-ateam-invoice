@@ -147,15 +147,16 @@ class TestParsePdfText(unittest.TestCase):
 
 class TestFractionalHours(unittest.TestCase):
     """
-    ATEAM-82924 is $8,595 = 95.5h × $90. An integer-only hours pattern found
-    nothing, fell back to 0 hours, and the invoice had to be voided and redone.
+    Real exports write "95h 30m", not a decimal. Matching only "95h" drops the
+    minutes: 95 × $90 = $8,550 against a stated $8,595 — which is exactly the
+    wrong invoice that got created as INV-82924 and had to be voided.
     """
 
     PDF_TEXT = textwrap.dedent("""\
         Earnings Statement #82924
         Date of issue: 02/05/2026
         SUMMARY FOR PERIOD  February 1 - February 15, 2026
-        TOTAL HOURS     95.5h
+        TOTAL HOURS     95h 30m
         HOURLY RATE     $90
         TOTAL PAYMENT   $8,595
     """)
@@ -171,8 +172,14 @@ class TestFractionalHours(unittest.TestCase):
         self.assertAlmostEqual(self._parse(self.PDF_TEXT)["hours"], 95.5)
 
     def test_whole_hours_still_parse(self):
-        text = self.PDF_TEXT.replace("95.5h", "95h").replace("$8,595", "$8,550")
+        text = self.PDF_TEXT.replace("95h 30m", "95h").replace("$8,595", "$8,550")
         self.assertAlmostEqual(self._parse(text)["hours"], 95.0)
+
+    def test_minutes_that_are_not_a_half_hour(self):
+        text = self.PDF_TEXT.replace("95h 30m", "79h 20m").replace("$8,595", "$7,140")
+        parsed = self._parse(text)
+        self.assertAlmostEqual(parsed["hours"], 79 + 20 / 60)
+        self.assertAlmostEqual(round(parsed["hours"] * 90, 2), 7140.00)
 
     def test_half_hour_invoice_reconciles(self):
         """95.5 × 90 = 8595 — the guard must let this through, not refuse it."""
@@ -674,6 +681,25 @@ class TestPeriodKey(unittest.TestCase):
         self.assertEqual(
             mod.period_key("Dylan Fitzgerald's Timesheet - Dec 16 - Dec 31.csv"),
             ("dec", 16, 31))
+
+    def test_openclaw_inbox_format(self):
+        """OpenClaw stores attachments with underscores for spaces and a uuid suffix."""
+        self.assertEqual(
+            mod.period_key("A.Team_Invoice_-_2026_Mar._01-15_85565---ec0d32a1.pdf"),
+            ("mar", 1, 15))
+        self.assertEqual(
+            mod.period_key("Dylan_Fitzgerald_s_Timesheet_-_Mar_16_-_Mar_31---caf32af0.csv"),
+            ("mar", 16, 31))
+
+    def test_openclaw_pdf_and_csv_pair_up(self):
+        pdf = "A.Team_Invoice_-_2026_Feb._16-28_84161---fd8944d6.pdf"
+        csv_name = "Dylan_Fitzgerald_s_Timesheet_-_Feb_16_-_Feb_28---aa8ce38c.csv"
+        pairs, ambiguous = mod.pair_csvs([pdf], [csv_name])
+        self.assertEqual(pairs, {pdf: csv_name})
+        self.assertEqual(ambiguous, [])
+
+    def test_uuid_suffix_does_not_create_a_false_period(self):
+        self.assertIsNone(mod.period_key("scan---8f0abd70-4e7d-4a69-8bc1.pdf"))
 
     def test_unrelated_file_has_no_period(self):
         self.assertIsNone(mod.period_key("BankStatement1130200222.pdf"))
