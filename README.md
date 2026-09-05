@@ -135,7 +135,7 @@ If both are provided and the totals disagree, the script warns and uses the PDF 
 uv run pytest tests/ -v
 ```
 
-56 tests covering date parsing, CSV hour formats, PDF regex parsing, exact-match idempotency, discrepancy detection, the invoice-total guard, env credential loading (precedence and merging), API payload shape, org ID propagation, payment routing, filename period-pairing, and batch behavior.
+62 tests covering date parsing, CSV hour formats, PDF regex parsing, exact-match idempotency, discrepancy detection, the invoice-total guard, env credential loading (precedence and merging), API payload shape, org ID propagation, payment routing, filename period-pairing, and batch behavior.
 
 ## Notes on the Zoho API
 

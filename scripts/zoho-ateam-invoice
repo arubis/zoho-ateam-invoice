@@ -179,6 +179,34 @@ def find_invoice_by_number(token, org_id, invoice_number):
     return None
 
 
+def uncategorized_deposit_dates(token, org_id, bank_account_id):
+    """
+    {amount: date} for deposits sitting unmatched on the bank account.
+
+    /banktransactions omits uncategorized rows unless asked for them by name,
+    so the default listing hides money that has landed but has not yet been
+    matched to an invoice. Recording a payment on the date it actually arrived
+    (rather than the invoice's issue date, 2-11 days earlier) is what lets
+    Zoho auto-suggest the match in the Banking screen.
+
+    An amount claimed by more than one deposit is dropped rather than guessed
+    at, the same way ambiguous CSV pairings are.
+    """
+    seen = {}
+    page = 1
+    while True:
+        resp = api("GET", "/banktransactions", token, org_id,
+                   extra_params=f"&account_id={bank_account_id}&per_page=200"
+                                f"&page={page}&filter_by=Status.Uncategorized")
+        rows = resp.get("banktransactions", [])
+        for t in rows:
+            seen.setdefault(round(float(t.get("amount", 0)), 2), []).append(t.get("date"))
+        if not resp.get("page_context", {}).get("has_more_page") or not rows:
+            break
+        page += 1
+    return {amt: dates[0] for amt, dates in seen.items() if len(dates) == 1}
+
+
 def list_invoices(token, org_id, customer_id):
     resp = api("GET", "/invoices", token, org_id,
                extra_params=f"&customer_id={customer_id}&per_page=200")
@@ -388,7 +416,7 @@ def record_payment(token, org_id, customer_id, bank_account_id, invoice_id, amou
         raise InvoiceError(f"payment recording failed: {resp.get('message', resp)}")
 
 
-def process_pdf(pdf_path, csv_path, cfg, token, dry_run):
+def process_pdf(pdf_path, csv_path, cfg, token, dry_run, deposit_dates=None):
     """
     Run one PDF through the pipeline. Returns a status for the batch summary:
     "created", "skipped" (already in Zoho), or "blocked" (dry run found a
@@ -443,9 +471,17 @@ def process_pdf(pdf_path, csv_path, cfg, token, dry_run):
                                 date_iso, hours, effective_rate, pdf_total, pdf["period"])
     print("  Marking as sent (no email)...")
     mark_sent(token, cfg["org_id"], invoice_id)
-    print("  Recording payment...")
+    # Date the payment when the money actually arrived, not when the invoice
+    # issued, so it lines up with the bank row Zoho will match it against.
+    pay_date = (deposit_dates or {}).get(round(pdf_total, 2))
+    if pay_date:
+        print(f"  Recording payment dated {pay_date} (matching bank deposit)...")
+    else:
+        pay_date = date_iso
+        print(f"  ⚠ no unmatched ${pdf_total:,.2f} deposit found — "
+              f"dating payment {pay_date} (invoice date)")
     record_payment(token, cfg["org_id"], cfg["customer_id"], cfg["bank_account_id"],
-                   invoice_id, pdf_total, date_iso)
+                   invoice_id, pdf_total, pay_date)
     print(f"  ✓ {inv_number} created, sent, paid (${pdf_total:,.2f})")
     return "created"
 
@@ -519,12 +555,16 @@ def main():
           f"{' [dry run]' if args.dry_run else ''}, {len(csv_for)} with a CSV cross-check")
 
     token = None if args.dry_run else get_access_token(env)
+    deposit_dates = None if args.dry_run else uncategorized_deposit_dates(
+        token, cfg["org_id"], cfg["bank_account_id"])
+    if deposit_dates is not None:
+        print(f"{len(deposit_dates)} unmatched deposit(s) available to date payments against")
 
     results = {}
     for pdf_path in pdfs:
         try:
             results[pdf_path] = process_pdf(pdf_path, csv_for.get(pdf_path), cfg,
-                                            token, args.dry_run)
+                                            token, args.dry_run, deposit_dates)
         except NotAnInvoice:
             if not walked:
                 print(f"  ✗ {os.path.basename(pdf_path)} is not an invoice PDF", file=sys.stderr)

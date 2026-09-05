@@ -208,6 +208,107 @@ class TestFractionalHours(unittest.TestCase):
         self.assertIn("82h", calls[0]["line_items"][0]["description"])
 
 
+class TestUncategorizedDepositDates(unittest.TestCase):
+    """
+    Money that has landed but isn't matched to an invoice is invisible to the
+    default /banktransactions listing — it needs filter_by=Status.Uncategorized.
+    """
+
+    def _api(self, pages):
+        calls = []
+
+        def fake(method, path, token, org_id, data=None, extra_params=""):
+            calls.append(extra_params)
+            return pages[len(calls) - 1]
+        return fake, calls
+
+    def test_asks_for_uncategorized_rows(self):
+        fake, calls = self._api([{"banktransactions": [], "page_context": {}}])
+        with patch.object(mod, "api", side_effect=fake):
+            mod.uncategorized_deposit_dates("tok", TEST_ORG_ID, TEST_BANK_ACCOUNT_ID)
+        self.assertIn("filter_by=Status.Uncategorized", calls[0])
+
+    def test_maps_amount_to_deposit_date(self):
+        fake, _ = self._api([{
+            "banktransactions": [
+                {"amount": 9802.50, "date": "2026-04-15"},
+                {"amount": 8392.50, "date": "2026-04-30"},
+            ],
+            "page_context": {"has_more_page": False},
+        }])
+        with patch.object(mod, "api", side_effect=fake):
+            dates = mod.uncategorized_deposit_dates("tok", TEST_ORG_ID, TEST_BANK_ACCOUNT_ID)
+        self.assertEqual(dates[9802.50], "2026-04-15")
+        self.assertEqual(dates[8392.50], "2026-04-30")
+
+    def test_follows_pagination(self):
+        fake, _ = self._api([
+            {"banktransactions": [{"amount": 100.0, "date": "2026-01-01"}],
+             "page_context": {"has_more_page": True}},
+            {"banktransactions": [{"amount": 200.0, "date": "2026-02-01"}],
+             "page_context": {"has_more_page": False}},
+        ])
+        with patch.object(mod, "api", side_effect=fake):
+            dates = mod.uncategorized_deposit_dates("tok", TEST_ORG_ID, TEST_BANK_ACCOUNT_ID)
+        self.assertEqual(set(dates), {100.0, 200.0})
+
+    def test_drops_amounts_claimed_by_two_deposits(self):
+        """Two identical deposits can't be told apart — don't guess."""
+        fake, _ = self._api([{
+            "banktransactions": [
+                {"amount": 7000.0, "date": "2026-04-15"},
+                {"amount": 7000.0, "date": "2026-05-15"},
+                {"amount": 1234.0, "date": "2026-06-15"},
+            ],
+            "page_context": {"has_more_page": False},
+        }])
+        with patch.object(mod, "api", side_effect=fake):
+            dates = mod.uncategorized_deposit_dates("tok", TEST_ORG_ID, TEST_BANK_ACCOUNT_ID)
+        self.assertNotIn(7000.0, dates)
+        self.assertIn(1234.0, dates)
+
+
+class TestPaymentDate(unittest.TestCase):
+    def _record(self, deposit_dates):
+        """Run one invoice through process_pdf; return the payment payload."""
+        posts = []
+
+        def fake_api(method, path, token, org_id, data=None, extra_params=""):
+            posts.append((path, data))
+            if path == "/invoices" and method == "GET":
+                return {"invoices": []}
+            return {"code": 0, "invoice": {"invoice_id": "inv_1"}}
+
+        pdf = MagicMock()
+        pdf.returncode = 0
+        pdf.stdout = textwrap.dedent("""\
+            Earnings Statement #85880
+            Date of issue: 04/06/2026
+            SUMMARY FOR PERIOD  March 16 - March 31, 2026
+            TOTAL HOURS     108h 55m
+            HOURLY RATE     $90
+            TOTAL PAYMENT   $9,802.50
+        """)
+        cfg = {"org_id": TEST_ORG_ID, "customer_id": TEST_CUSTOMER_ID,
+               "bank_account_id": TEST_BANK_ACCOUNT_ID, "prefix": "ATEAM", "rate": 90}
+        from io import StringIO
+        with patch("subprocess.run", return_value=pdf), \
+             patch.object(mod, "api", side_effect=fake_api), \
+             patch("sys.stdout", StringIO()):
+            mod.process_pdf("x.pdf", None, cfg, "tok", False, deposit_dates)
+        return next(d for p, d in posts if p == "/customerpayments")
+
+    def test_uses_the_matching_deposit_date(self):
+        payload = self._record({9802.50: "2026-04-15"})
+        self.assertEqual(payload["date"], "2026-04-15",
+                         "payment should carry the date the money arrived")
+        self.assertAlmostEqual(payload["amount"], 9802.50)
+
+    def test_falls_back_to_invoice_date_when_no_deposit_matches(self):
+        payload = self._record({})
+        self.assertEqual(payload["date"], "2026-04-06")
+
+
 class TestExtractPeriod(unittest.TestCase):
     def test_real_layout_takes_value_from_next_line(self):
         """In the actual exports SUMMARY FOR PERIOD is a column header."""
