@@ -195,6 +195,15 @@ class TestFractionalHours(unittest.TestCase):
         line = calls[0]["line_items"][0]
         self.assertEqual(round(line["rate"] * line["quantity"], 2), 8595.0)
 
+    def test_hours_render_the_way_the_pdf_writes_them(self):
+        self.assertEqual(mod.format_hours(108 + 55 / 60), "108h 55m")
+        self.assertEqual(mod.format_hours(95.5), "95h 30m")
+        self.assertEqual(mod.format_hours(82.0), "82h")
+        self.assertEqual(mod.format_hours(56 + 40 / 60), "56h 40m")
+
+    def test_float_noise_never_produces_sixty_minutes(self):
+        self.assertEqual(mod.format_hours(79.99999), "80h")
+
     def test_whole_hours_render_without_a_trailing_zero(self):
         calls = []
 
@@ -205,7 +214,7 @@ class TestFractionalHours(unittest.TestCase):
         with patch.object(mod, "api", side_effect=mock_api):
             mod.create_invoice("tok", TEST_ORG_ID, TEST_CUSTOMER_ID, "ATEAM-1",
                                "2026-02-05", 82.0, 90, 7380.0, "Feb 2026")
-        self.assertIn("82h", calls[0]["line_items"][0]["description"])
+        self.assertIn("82h ×", calls[0]["line_items"][0]["description"])
 
 
 class TestUncategorizedDepositDates(unittest.TestCase):

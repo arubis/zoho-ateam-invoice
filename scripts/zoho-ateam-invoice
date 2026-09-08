@@ -222,6 +222,18 @@ def list_invoices(token, org_id, customer_id):
         print(f"{inv['invoice_number']:<20} {inv['date']:<12} ${float(inv['total']):>9,.2f}  {icon} {status}")
 
 
+def format_hours(hours):
+    """
+    Render hours the way the export writes them: 108.91666... -> "108h 55m".
+    A bare decimal is accurate but harder to check against the source PDF.
+    """
+    whole = int(hours)
+    minutes = round((hours - whole) * 60)
+    if minutes == 60:          # 79.9999 from float division must not become "79h 60m"
+        whole, minutes = whole + 1, 0
+    return f"{whole}h {minutes}m" if minutes else f"{whole}h"
+
+
 def extract_period(text):
     """
     The billing period, which ends up in the invoice line description.
@@ -373,7 +385,7 @@ def create_invoice(token, org_id, customer_id, inv_number, date_iso, hours, rate
     computed = round(hours * rate, 2)
     if abs(computed - total) > 0.01:
         raise InvoiceError(
-            f"{hours:g}h × ${rate}/hr = ${computed:,.2f}, but the PDF total is ${total:,.2f}. "
+            f"{format_hours(hours)} × ${rate}/hr = ${computed:,.2f}, but the PDF total is ${total:,.2f}. "
             "Fix the hours or rate in the source PDF, or create this invoice by hand."
         )
 
@@ -385,7 +397,7 @@ def create_invoice(token, org_id, customer_id, inv_number, date_iso, hours, rate
         "reference_number": f"Statement #{inv_number.split('-')[-1]}",
         "line_items": [{
             "name": "Engineering Services",
-            "description": f"{hours:g}h × ${rate}/hr — {period}",
+            "description": f"{format_hours(hours)} × ${rate}/hr — {period}",
             "rate": rate,
             "quantity": hours,
         }]
@@ -441,12 +453,12 @@ def process_pdf(pdf_path, csv_path, cfg, token, dry_run, deposit_dates=None):
     print(f"  Date:     {date_iso}")
     print(f"  Period:   {pdf['period']}")
     if csv_hours is not None:
-        print(f"  Hours:    {hours:g}h (PDF) / {csv_hours:.1f}h (CSV — {os.path.basename(csv_path)})")
+        print(f"  Hours:    {format_hours(hours)} (PDF) / {csv_hours:.1f}h (CSV — {os.path.basename(csv_path)})")
         csv_total = round(csv_hours * effective_rate, 2)
         if abs(csv_total - pdf_total) > 0.01:
             print(f"  ⚠ Total mismatch: CSV says ${csv_total:,.2f}, PDF says ${pdf_total:,.2f} — using PDF")
     else:
-        print(f"  Hours:    {hours:g}h (PDF, no CSV)")
+        print(f"  Hours:    {format_hours(hours)} (PDF, no CSV)")
     print(f"  Total:    ${pdf_total:,.2f}")
 
     # Surface here what create_invoice() would refuse on, so a dry run never
@@ -454,7 +466,7 @@ def process_pdf(pdf_path, csv_path, cfg, token, dry_run, deposit_dates=None):
     computed = round(hours * effective_rate, 2)
     mismatched = abs(computed - pdf_total) > 0.01
     if mismatched:
-        print(f"  ✗ {hours:g}h × ${effective_rate}/hr = ${computed:,.2f}, but the PDF total is "
+        print(f"  ✗ {format_hours(hours)} × ${effective_rate}/hr = ${computed:,.2f}, but the PDF total is "
               f"${pdf_total:,.2f} — will refuse to create this invoice.")
 
     if dry_run:
